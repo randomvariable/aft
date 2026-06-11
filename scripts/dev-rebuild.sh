@@ -80,7 +80,7 @@ echo
 # 5. Stage + sign the binary
 echo "==> staging binary into versioned cache"
 mkdir -p "$CACHE_DIR"
-cp target/release/aft "$BINARY_PATH"
+#cp target/release/aft "$BINARY_PATH"
 chmod +x "$BINARY_PATH"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
