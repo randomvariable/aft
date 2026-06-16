@@ -22,24 +22,24 @@ cd "$REPO_ROOT"
 
 SKIP_RUST=0
 for arg in "$@"; do
-  case "$arg" in
-    --skip-rust) SKIP_RUST=1 ;;
-    -h|--help)
-      sed -n '1,/^set /p' "$0" | sed 's/^# \{0,1\}//' | head -n -1
-      exit 0
-      ;;
-    *)
-      echo "unknown argument: $arg" >&2
-      exit 2
-      ;;
-  esac
+    case "$arg" in
+        --skip-rust) SKIP_RUST=1 ;;
+        -h|--help)
+            sed -n '1,/^set /p' "$0" | sed 's/^# \{0,1\}//' | head -n -1
+            exit 0
+        ;;
+        *)
+            echo "unknown argument: $arg" >&2
+            exit 2
+        ;;
+    esac
 done
 
 # Read version from the canonical source (Cargo.toml).
 VERSION="$(awk -F'"' '/^version = / {print $2; exit}' crates/aft/Cargo.toml)"
 if [[ -z "$VERSION" ]]; then
-  echo "error: could not read version from crates/aft/Cargo.toml" >&2
-  exit 1
+    echo "error: could not read version from crates/aft/Cargo.toml" >&2
+    exit 1
 fi
 
 CACHE_DIR="${HOME}/.cache/aft/bin/v${VERSION}"
@@ -51,15 +51,15 @@ echo
 
 # 1. Rust release binary
 if [[ "$SKIP_RUST" -eq 0 ]]; then
-  echo "==> building Rust release binary"
-  cargo build --release -p agent-file-tools
-  echo
+    echo "==> building Rust release binary"
+    cargo build --release -p agent-file-tools
+    echo
 else
-  echo "==> skipping Rust build (--skip-rust)"
-  if [[ ! -f "target/release/aft" ]]; then
-    echo "error: --skip-rust requires target/release/aft to exist already" >&2
-    exit 1
-  fi
+    echo "==> skipping Rust build (--skip-rust)"
+    if [[ ! -f "target/release/aft" ]]; then
+        echo "error: --skip-rust requires target/release/aft to exist already" >&2
+        exit 1
+    fi
 fi
 
 # 2. aft-bridge dist (must build first — plugins depend on it)
@@ -80,12 +80,13 @@ echo
 # 5. Stage + sign the binary
 echo "==> staging binary into versioned cache"
 mkdir -p "$CACHE_DIR"
-#cp target/release/aft "$BINARY_PATH"
+CARGO_TARGET="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])')"
+cp "${CARGO_TARGET}/release/aft" "$BINARY_PATH"
 chmod +x "$BINARY_PATH"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  echo "==> ad-hoc signing for macOS"
-  codesign --force --sign - "$BINARY_PATH"
+    echo "==> ad-hoc signing for macOS"
+    codesign --force --sign - "$BINARY_PATH"
 fi
 echo
 
@@ -95,7 +96,7 @@ REPORTED_VERSION="$("$BINARY_PATH" --version 2>&1)"
 echo "    ${REPORTED_VERSION}"
 
 if ! echo "$REPORTED_VERSION" | grep -q "$VERSION"; then
-  echo "warning: staged binary version mismatch (expected ${VERSION})" >&2
+    echo "warning: staged binary version mismatch (expected ${VERSION})" >&2
 fi
 
 echo
