@@ -643,10 +643,11 @@ fn build_missing_search_after_strict_check(
                     && !admission.cancellation_requested()
             },
             || {
-                crate::search_index::SearchIndex::resume_cold_build_slice(
+                crate::search_index::SearchIndex::resume_cold_build_slice_with_admission(
                     &entry.resolved_target,
                     max_file_size,
                     &cache_dir,
+                    Some(&ctx.memory_admission_ledger()),
                 )
                 .ok()
             },
@@ -685,13 +686,14 @@ fn build_missing_semantic_after_strict_check(
             return (false, true);
         }
     };
-    match crate::semantic_index::SemanticIndex::resume_cold_build_slice(
+    match crate::semantic_index::SemanticIndex::resume_cold_build_slice_with_ledger(
         &entry.resolved_target,
         &files,
         &mut model,
         &semantic_config,
         &storage_dir,
         &entry.artifact_key,
+        Some(&ctx.memory_admission_ledger()),
     ) {
         Ok(crate::semantic_index::SemanticBuildSliceOutcome::Complete) => (true, false),
         Ok(crate::semantic_index::SemanticBuildSliceOutcome::Yielded) => (false, true),

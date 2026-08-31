@@ -939,6 +939,15 @@ impl SearchIndex {
         max_file_size: u64,
         cache_dir: &Path,
     ) -> std::io::Result<SearchBuildSliceOutcome> {
+        Self::resume_cold_build_slice_with_admission(root, max_file_size, cache_dir, None)
+    }
+
+    pub(crate) fn resume_cold_build_slice_with_admission(
+        root: &Path,
+        max_file_size: u64,
+        cache_dir: &Path,
+        ledger: Option<&Arc<crate::memory_admission::MemoryAdmissionLedger>>,
+    ) -> std::io::Result<SearchBuildSliceOutcome> {
         fs::create_dir_all(cache_dir)?;
         let staging_dir = cache_dir.join(SEARCH_STAGING_DIR);
         let manifest_path = staging_dir.join(SEARCH_STAGING_MANIFEST);
@@ -977,8 +986,20 @@ impl SearchIndex {
 
         if manifest.cursor < manifest.paths.len() {
             let end = (manifest.cursor + SEARCH_SLICE_FILES).min(manifest.paths.len());
+            let selected = &manifest.paths[manifest.cursor..end];
+            let estimate = estimate_search_slice_memory(selected, max_file_size);
+            let _reservation = match ledger {
+                Some(ledger) => match ledger.reserve(
+                    crate::memory_admission::MemoryAdmissionClass::Search,
+                    estimate,
+                ) {
+                    Ok(reservation) => Some(reservation),
+                    Err(_) => return Ok(SearchBuildSliceOutcome::Yielded),
+                },
+                None => None,
+            };
             let mut block = Vec::new();
-            for path in &manifest.paths[manifest.cursor..end] {
+            for path in selected {
                 let file_id = u32::try_from(manifest.files.len())
                     .map_err(|_| std::io::Error::other("too many files to index"))?;
                 match prepare_search_path(path, max_file_size) {
@@ -2786,7 +2807,6 @@ fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
         Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
         _ => return PreparedSearchPath::Skipped,
     };
-
     if is_binary_path(path, metadata.size) || metadata.size > max_file_size {
         return PreparedSearchPath::Unindexed(metadata);
     }
@@ -2804,6 +2824,17 @@ fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
         metadata,
         content_hash: cache_freshness::hash_bytes(&content),
         trigram_map: trigram_filter_map(&content, true),
+    })
+}
+fn estimate_search_slice_memory(paths: &[PathBuf], max_file_size: u64) -> u64 {
+    paths.iter().fold(0u64, |total, path| {
+        let content = fs::metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len().min(max_file_size))
+            .unwrap_or(0);
+        let trigram_records = content.saturating_sub(2).saturating_mul(16);
+        total.saturating_add(content).saturating_add(trigram_records).saturating_add(64)
     })
 }
 
@@ -8524,6 +8555,31 @@ mod tests {
             serial_grep.files_with_matches,
             parallel_grep.files_with_matches
         );
+    }
+
+    #[test]
+    fn denied_search_slice_admission_does_not_prepare_selected_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(project.join("selected.rs"), "fn selected() {}\n").expect("write source");
+        let ledger = Arc::new(crate::memory_admission::MemoryAdmissionLedger::new(Some(0)));
+
+        assert_eq!(
+            SearchIndex::resume_cold_build_slice_with_admission(
+                &project,
+                DEFAULT_MAX_FILE_SIZE,
+                &cache,
+                Some(&ledger),
+            )
+            .expect("denied slice returns yielded"),
+            SearchBuildSliceOutcome::Yielded
+        );
+        assert!(!cache.join(SEARCH_STAGING_DIR).join(SEARCH_STAGING_MANIFEST).exists());
+        assert!(!cache.join("cache.bin").exists());
+        assert_eq!(ledger.snapshot().charged_bytes, 0);
+        assert_eq!(ledger.snapshot().denied_total, 1);
     }
 
     #[test]

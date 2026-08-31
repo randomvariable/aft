@@ -1297,6 +1297,7 @@ pub struct App {
     open_routes: AtomicUsize,
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
+    memory_admission_ledger: Arc<crate::memory_admission::MemoryAdmissionLedger>,
     provider_factory: LanguageProviderFactory,
     /// Weak actor references let status attribute process RSS across roots
     /// without making the process-global App own per-root caches.
@@ -1312,6 +1313,9 @@ impl App {
             open_routes: AtomicUsize::new(0),
             lsp_child_registry: crate::lsp::child_registry::LspChildRegistry::new(),
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
+            memory_admission_ledger: Arc::new(
+                crate::memory_admission::MemoryAdmissionLedger::new(None),
+            ),
             provider_factory,
             memory_contexts: parking_lot::Mutex::new(BTreeMap::new()),
         }
@@ -1336,6 +1340,12 @@ impl App {
 
     pub fn stdout_writer(&self) -> SharedStdoutWriter {
         Arc::clone(&self.stdout_writer)
+    }
+
+    pub fn memory_admission_ledger(
+        &self,
+    ) -> Arc<crate::memory_admission::MemoryAdmissionLedger> {
+        Arc::clone(&self.memory_admission_ledger)
     }
 
     pub(crate) fn register_memory_context(&self, root: PathBuf, ctx: &Arc<AppContext>) {
@@ -3628,6 +3638,9 @@ impl AppContext {
     /// Atomically publish a fully-built configuration snapshot.
     pub fn set_config(&self, config: Config) {
         let next = Arc::new(config);
+        self.app
+            .memory_admission_ledger()
+            .set_limit(next.memory.limit_bytes);
         let project_root_changed = {
             let mut guard = self
                 .config

@@ -59,6 +59,25 @@ afterEach(() => {
   }
   tempRoots.clear();
 });
+  test("accepts only safe positive memory limits and strips project memory", () => {
+    expect(AftConfigSchema.parse({}).memory).toBeUndefined();
+    expect(AftConfigSchema.safeParse({ memory: { limit_bytes: 0 } }).success).toBe(false);
+    expect(AftConfigSchema.safeParse({ memory: { limit_bytes: -1 } }).success).toBe(false);
+    expect(AftConfigSchema.safeParse({ memory: { limit_bytes: 1.5 } }).success).toBe(false);
+    expect(AftConfigSchema.safeParse({ memory: { limit_bytes: Number.MAX_SAFE_INTEGER + 1 } }).success).toBe(false);
+    expect(AftConfigSchema.parse({ memory: { limit_bytes: Number.MAX_SAFE_INTEGER } }).memory?.limit_bytes).toBe(Number.MAX_SAFE_INTEGER);
+
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ memory: { limit_bytes: 4096 } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ memory: { limit_bytes: 8192 } }));
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).memory).toEqual({ limit_bytes: 4096 });
+    expect(result.stderr).toContain("Ignoring memory");
+  });
+
 
 describe("loadAftConfig", () => {
   test("returns an empty config when user and project config files are missing", () => {

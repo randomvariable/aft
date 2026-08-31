@@ -722,10 +722,35 @@ impl Drop for ColdBuildSliceBudgetGuard {
     }
 }
 
-fn with_cold_build_slice_budget<R>(budget: usize, run: impl FnOnce() -> R) -> R {
+fn cold_build_extract_window_bytes(file_count: usize) -> u64 {
+    let record_bytes = std::mem::size_of::<FileExtract>()
+        + std::mem::size_of::<NodeRecord>()
+        + std::mem::size_of::<RawRef>()
+        + std::mem::size_of::<DispatchHint>();
+    (COLD_BUILD_EXTRACT_BATCH_BYTES as usize)
+        .saturating_add(file_count.saturating_mul(record_bytes)) as u64
+}
+
+fn with_cold_build_slice_budget<R>(
+    budget: usize,
+    ledger: Option<&Arc<crate::memory_admission::MemoryAdmissionLedger>>,
+    run: impl FnOnce() -> R,
+) -> Result<R, CallGraphStoreError> {
+    let reservation = ledger
+        .map(|ledger| {
+            ledger
+                .reserve(
+                    crate::memory_admission::MemoryAdmissionClass::Callgraph,
+                    cold_build_extract_window_bytes(COLD_BUILD_EXTRACT_BATCH_FILES),
+                )
+                .map_err(CallGraphStoreError::MemoryAdmission)
+        })
+        .transpose()?;
     let previous = COLD_BUILD_SLICE_BUDGET.with(|slot| slot.replace(Some(budget.max(1))));
     let _guard = ColdBuildSliceBudgetGuard { previous };
-    run()
+    let result = run();
+    drop(reservation);
+    Ok(result)
 }
 pub(crate) fn with_publish_epoch<R>(
     epoch: crate::root_cache::ArtifactPublishEpoch,
@@ -835,6 +860,7 @@ pub enum CallGraphStoreError {
     Json(serde_json::Error),
     Aft(AftError),
     Lock(crate::fs_lock::AcquireError),
+    MemoryAdmission(crate::memory_admission::MemoryAdmissionError),
     MissingCallerData {
         file: String,
     },
@@ -870,10 +896,13 @@ impl fmt::Display for CallGraphStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
-            Self::Sqlite(error) => write!(formatter, "sqlite error: {error}"),
-            Self::Json(error) => write!(formatter, "json error: {error}"),
-            Self::Aft(error) => write!(formatter, "callgraph extraction error: {error}"),
-            Self::Lock(error) => write!(formatter, "callgraph writer lease error: {error}"),
+            Self::MemoryAdmission(error) => write!(
+                formatter,
+                "callgraph memory admission denied: {} bytes requested ({} charged, limit {:?})",
+                error.requested_bytes,
+                error.charged_bytes,
+                error.limit_bytes
+            ),
             Self::MissingCallerData { file } => {
                 write!(formatter, "missing extracted caller data for {file}")
             }
@@ -2934,11 +2963,7 @@ impl CallGraphStore {
         chunk_size: usize,
     ) -> Result<(Self, ColdBuildStats)> {
         Self::cold_build_with_lease_chunked_inner(
-            callgraph_dir,
-            project_root,
-            files,
-            chunk_size,
-            false,
+            callgraph_dir, project_root, files, chunk_size, false,
         )
     }
 
@@ -2948,26 +2973,28 @@ impl CallGraphStore {
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<ColdBuildSlice> {
-        let result = with_cold_build_slice_budget(1, || {
+        Self::resume_cold_build_slice_with_lease_and_ledger(
+            callgraph_dir, project_root, files, chunk_size, None,
+        )
+    }
+
+    pub fn resume_cold_build_slice_with_lease_and_ledger(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        files: &[PathBuf],
+        chunk_size: usize,
+        ledger: Option<&Arc<crate::memory_admission::MemoryAdmissionLedger>>,
+    ) -> Result<ColdBuildSlice> {
+        let result = with_cold_build_slice_budget(1, ledger, || {
             Self::cold_build_with_lease_chunked_inner(
-                callgraph_dir,
-                project_root,
-                files,
-                chunk_size,
-                false,
+                callgraph_dir, project_root, files, chunk_size, false,
             )
-        });
+        })?;
         match result {
             Ok((store, stats)) => Ok(ColdBuildSlice::Complete { store, stats }),
-            Err(CallGraphStoreError::SliceProgress {
-                phase,
-                completed,
-                total,
-            }) => Ok(ColdBuildSlice::Progress {
-                phase,
-                completed,
-                total,
-            }),
+            Err(CallGraphStoreError::SliceProgress { phase, completed, total }) => {
+                Ok(ColdBuildSlice::Progress { phase, completed, total })
+            }
             Err(CallGraphStoreError::Superseded) => Ok(ColdBuildSlice::Superseded),
             Err(error) => Err(error),
         }
@@ -18435,11 +18462,6 @@ class OnlyService {
         }
     }
 
-    fn write_fixture(root: &std::path::Path, rel_path: &str, source: &str) {
-        let path = root.join(rel_path);
-        fs::create_dir_all(path.parent().expect("fixture parent")).expect("create parent");
-        fs::write(path, source).expect("write fixture");
-    }
 
     fn line_of(source: &str, needle: &str) -> u32 {
         source
@@ -18455,8 +18477,20 @@ mod bounded_build_breaker_tests {
     use super::*;
     use crate::build_breaker::{BreakerAdmission, BreakerKey, BuildDeathBreaker, BuildDomain};
     use tempfile::tempdir;
-
     #[test]
+    fn denied_cold_build_memory_window_does_not_enter_payload() {
+        let ledger = Arc::new(crate::memory_admission::MemoryAdmissionLedger::new(Some(1)));
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_by_payload = Arc::clone(&entered);
+        let result = with_cold_build_slice_budget(1, Some(&ledger), || {
+            entered_by_payload.store(true, AtomicOrdering::Release);
+            Ok::<_, CallGraphStoreError>(())
+        });
+        assert!(result.is_err());
+        assert!(!entered.load(AtomicOrdering::Acquire));
+        assert_eq!(ledger.snapshot().denied_total, 1);
+    }
+
     fn staged_inventory_drives_ordered_bounded_file_batches() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");

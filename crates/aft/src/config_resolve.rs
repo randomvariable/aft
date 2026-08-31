@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
-    IndexConfig, IndexKind, IndexResourcePolicy, IndexRootConfig, InspectConfig, SandboxConfig,
+    IndexConfig, IndexKind, IndexResourcePolicy, IndexRootConfig, InspectConfig, MemoryConfig, SandboxConfig,
     SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
     DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
     MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
@@ -111,7 +111,7 @@ pub struct RawAftConfig {
     pub disabled_tools: Option<Vec<String>>,
     pub restrict_to_project_root: Option<bool>,
     pub search_index: Option<bool>,
-    pub index: Option<RawIndex>,
+    pub memory: Option<RawMemory>,
     pub semantic_search: Option<bool>,
     pub callgraph_store: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_usize")]
@@ -134,6 +134,12 @@ pub struct RawAftConfig {
     /// Raw per-harness objects stay opaque until the resolver knows the active
     /// configure harness. Unknown harness names are intentionally ignored.
     pub harnesses: Option<BTreeMap<String, Value>>,
+}
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawMemory {
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,6 +860,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.auto_update.is_some() {
         base.auto_update = override_config.auto_update;
     }
+    if override_config.memory.is_some() {
+        base.memory = override_config.memory;
+    }
     if override_config.bridge.is_some() {
         base.bridge = override_config.bridge;
     }
@@ -905,6 +914,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.lsp = merge_lsp_config(base.lsp.clone(), project.lsp);
     base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
+    // memory is user-only; record and ignore project values below.
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
     base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
     if project.git.is_some() {
@@ -1302,6 +1312,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
             push_drop(dropped, "lsp.disabled", tier, LSP_USER_ONLY_REASON);
         }
     }
+    if raw.memory.is_some() {
+        push_drop(dropped, "memory", tier, USER_ONLY_REASON);
+    }
 }
 
 fn push_drop(dropped: &mut Vec<DroppedKey>, key: &str, tier: &str, reason: &str) {
@@ -1365,6 +1378,11 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     }
     config.semantic = resolve_semantic_config(raw.semantic.as_ref(), raw.subc.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
+    config.memory = raw
+        .memory
+        .as_ref()
+        .map(|memory| MemoryConfig { limit_bytes: memory.limit_bytes })
+        .unwrap_or_default();
     config.backup = resolve_backup_config(raw.backup.as_ref());
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
@@ -3057,6 +3075,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["project", "mcp:untrusted"]
         );
+    }
+
+    #[test]
+    fn memory_limit_is_user_only_and_requires_positive_integer() {
+        let user = resolve_config(&[tier("user", r#"{"memory":{"limit_bytes":4096}}"#)]);
+        assert_eq!(user.config.memory.limit_bytes, Some(4096));
+        let project = resolve_config(&[
+            tier("user", r#"{"memory":{"limit_bytes":4096}}"#),
+            tier("project", r#"{"memory":{"limit_bytes":8192}}"#),
+        ]);
+        assert_eq!(project.config.memory.limit_bytes, Some(4096));
+        assert_eq!(drop_keys(&project), vec!["memory"]);
+        let zero = resolve_config(&[tier("user", r#"{"memory":{"limit_bytes":0}}"#)]);
+        assert_eq!(zero.config.memory.limit_bytes, None);
     }
 
     #[test]

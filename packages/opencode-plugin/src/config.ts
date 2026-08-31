@@ -406,6 +406,10 @@ const BackupConfigSchema = z.object({
   max_file_size: z.number().int().positive().optional(),
 });
 
+const MemoryConfigSchema = z.object({
+  limit_bytes: z.number().int().positive().safe().optional(),
+});
+
 const AftConfigFieldsSchema = z.object({
   /**
    * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
@@ -490,6 +494,8 @@ const AftConfigFieldsSchema = z.object({
   callgraph_chunk_size: z.number().optional(),
   /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
   inspect: InspectConfigSchema.optional(),
+  /** User-only process memory admission ceiling. */
+  memory: MemoryConfigSchema.optional(),
   /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
   backup: BackupConfigSchema.optional(),
   /**
@@ -1545,6 +1551,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "storage_dir" — USER ONLY (controls where AFT writes).
   // "auto_update" — USER ONLY (silently suppressing security updates is a real risk).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
+  // "memory" — USER ONLY (process-wide resource ceiling).
   // "gh_read" — USER ONLY because it changes the global tool description.
   // Advertising disabled resource spellings wastes prompt tokens and confuses
   // steering; project-specific surface changes also destabilize prefix caches.
@@ -1575,6 +1582,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
+  if (override.memory !== undefined) stripped.push("memory");
   if (override.gh_read !== undefined) stripped.push("gh_read");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;

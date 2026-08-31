@@ -647,7 +647,7 @@ struct HealthDiagnosticRollup {
 }
 
 impl HealthDiagnosticRollup {
-    fn unavailable() -> Self {
+    fn unavailable(admission: crate::memory_admission::MemoryAdmissionSnapshot) -> Self {
         Self {
             status: HealthStatus::Degraded,
             detail: Some("health diagnostic snapshot is being refreshed".to_string()),
@@ -660,7 +660,7 @@ impl HealthDiagnosticRollup {
                 "callgraph_repair_roots_total": 0,
                 "callgraph_commits_60s_total": 0,
                 "callgraph_pages_or_bytes_written_60s_total": 0,
-                "memory": memory_rollup_metrics(None),
+                "memory": memory_rollup_metrics(None, admission),
                 "mutating_lanes": { "scheduler_busy": true },
                 "roots": [],
             }),
@@ -679,7 +679,9 @@ impl HealthRollupCache {
         Self {
             origin: Instant::now(),
             generated_at_ms: AtomicU64::new(0),
-            snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
+            snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable(
+                crate::memory_admission::MemoryAdmissionLedger::new(None).snapshot(),
+            ))),
         }
     }
 
@@ -703,7 +705,9 @@ impl HealthRollupCache {
             Ok(snapshot) => Arc::clone(&snapshot),
             Err(std::sync::TryLockError::Poisoned(error)) => Arc::clone(&error.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => {
-                Arc::new(HealthDiagnosticRollup::unavailable())
+                Arc::new(HealthDiagnosticRollup::unavailable(
+                    crate::memory_admission::MemoryAdmissionLedger::new(None).snapshot(),
+                ))
             }
         };
         (snapshot, age_ms)
@@ -714,12 +718,24 @@ impl HealthRollupCache {
 /// subsystem detail is never constructed for roots omitted by the top-N cap.
 fn memory_rollup_metrics(
     roots: Option<std::collections::BTreeMap<String, crate::memory::RootMemoryRollup>>,
+    admission: crate::memory_admission::MemoryAdmissionSnapshot,
 ) -> Value {
     let Some(roots) = roots else {
         return json!({
             "status": "busy",
             "allocator_slack_bytes": 0,
             "allocator_slack_measured": false,
+            "limit_bytes": admission.limit_bytes,
+            "charged_bytes": admission.charged_bytes,
+            "peak_charged_bytes": admission.peak_charged_bytes,
+            "available_bytes": admission.available_bytes,
+            "denied_total": admission.denied_total,
+            "last_denied": admission.last_denied.map(|denied| json!({
+                "class": format!("{:?}", denied.class).to_lowercase(),
+                "requested_bytes": denied.requested_bytes,
+                "charged_bytes": denied.charged_bytes,
+                "limit_bytes": denied.limit_bytes,
+            })),
         });
     };
     let snapshot = crate::memory::MemoryRollupSnapshot::new("ready", roots);
@@ -745,14 +761,22 @@ fn memory_rollup_metrics(
         "roots_omitted": snapshot.roots_omitted,
         "roots_omitted_bytes": snapshot.roots_omitted_bytes,
         "rss_bytes": snapshot.process.rss_bytes,
-        // Zero means either measured zero slack or unavailable allocator counters;
-        // the sibling boolean disambiguates "no slack" from "unmeasurable".
         "allocator_slack_bytes": snapshot.process.allocator.retained_slack_bytes.unwrap_or(0),
         "allocator_slack_measured": snapshot.process.allocator.retained_slack_bytes.is_some(),
-        // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
         "sqlite_bytes": snapshot.process.sqlite.memory_used_bytes,
+        "limit_bytes": admission.limit_bytes,
+        "charged_bytes": admission.charged_bytes,
+        "peak_charged_bytes": admission.peak_charged_bytes,
+        "available_bytes": admission.available_bytes,
+        "denied_total": admission.denied_total,
+        "last_denied": admission.last_denied.map(|denied| json!({
+            "class": format!("{:?}", denied.class).to_lowercase(),
+            "requested_bytes": denied.requested_bytes,
+            "charged_bytes": denied.charged_bytes,
+            "limit_bytes": denied.limit_bytes,
+        })),
     })
 }
 
@@ -820,7 +844,10 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
             detail: Some(
                 "executor scheduler state could not be snapshotted without contention".to_string(),
             ),
-            metrics: HealthDiagnosticRollup::unavailable().metrics,
+            metrics: HealthDiagnosticRollup::unavailable(
+                shared_app.memory_admission_ledger().snapshot(),
+            )
+            .metrics,
         };
     };
 
@@ -925,7 +952,6 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
     let root_details_omitted = candidates.len().saturating_sub(HEALTH_ROOT_DETAIL_CAP);
     let mut roots: Vec<(String, Value)> = candidates
         .into_iter()
-        .take(HEALTH_ROOT_DETAIL_CAP)
         .map(|candidate| {
             let mut snapshot = candidate.health;
             snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
@@ -945,7 +971,7 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
     let root_count = root_details_omitted.saturating_add(roots.len());
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
-    let memory = memory_rollup_metrics(Some(memory_roots));
+    let memory = memory_rollup_metrics(Some(memory_roots), shared_app.memory_admission_ledger().snapshot());
     let lsp_children = shared_app.lsp_child_registry().try_health_snapshot();
     let detail = if busy_roots > 0 {
         Some(format!(
@@ -1550,12 +1576,36 @@ mod tests {
         assert_eq!(runtime["spawned_lsp_children"].as_u64(), Some(1));
         assert_eq!(runtime["lsp_children_with_deleted_cwd"].as_u64(), Some(0));
 
-        let busy_memory = memory_rollup_metrics(None);
+        let busy_memory = memory_rollup_metrics(
+            None,
+            crate::memory_admission::MemoryAdmissionLedger::new(None).snapshot(),
+        );
         assert_eq!(busy_memory["allocator_slack_bytes"].as_u64(), Some(0));
         assert_eq!(
             busy_memory["allocator_slack_measured"].as_bool(),
             Some(false)
         );
+        let admission = crate::memory_admission::MemoryAdmissionLedger::new(None).snapshot();
+        for key in [
+            "limit_bytes",
+            "charged_bytes",
+            "peak_charged_bytes",
+            "available_bytes",
+            "denied_total",
+            "last_denied",
+        ] {
+            assert!(busy_memory.get(key).is_some(), "busy memory missing {key}");
+        }
+        assert!(busy_memory["limit_bytes"].is_null());
+        assert!(busy_memory["available_bytes"].is_null());
+        assert_eq!(busy_memory["charged_bytes"].as_u64(), Some(0));
+        assert_eq!(busy_memory["denied_total"].as_u64(), Some(0));
+        let ready_memory =
+            memory_rollup_metrics(Some(std::collections::BTreeMap::new()), admission.clone());
+        assert!(ready_memory.get("limit_bytes").is_some());
+        assert!(ready_memory.get("available_bytes").is_some());
+        assert!(HealthDiagnosticRollup::unavailable(admission).metrics["memory"]
+            .get("limit_bytes").is_some());
         registry.untrack(std::process::id());
     }
 

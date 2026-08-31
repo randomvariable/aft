@@ -2846,6 +2846,28 @@ impl SemanticIndex {
             &mut should_continue,
         )
     }
+fn embed_incremental_with_memory_admission<F>(
+    ledger: &Arc<crate::memory_admission::MemoryAdmissionLedger>,
+    batch_len: usize,
+    dimension: usize,
+    embed: F,
+) -> Result<Option<Vec<Vec<f32>>>, String>
+where
+    F: FnOnce() -> Result<Vec<Vec<f32>>, String>,
+{
+    let bytes = (batch_len as u64)
+        .saturating_mul(dimension as u64)
+        .saturating_mul(std::mem::size_of::<f32>() as u64);
+    let _reservation = match ledger.reserve(
+        crate::memory_admission::MemoryAdmissionClass::Semantic,
+        bytes,
+    ) {
+        Ok(reservation) => reservation,
+        Err(_) => return Ok(None),
+    };
+    embed().map(Some)
+}
+
     pub(crate) fn resume_cold_build_slice(
         project_root: &Path,
         files: &[PathBuf],
@@ -2853,6 +2875,26 @@ impl SemanticIndex {
         config: &SemanticBackendConfig,
         storage_dir: &Path,
         project_key: &str,
+    ) -> Result<SemanticBuildSliceOutcome, String> {
+        Self::resume_cold_build_slice_with_ledger(
+            project_root,
+            files,
+            model,
+            config,
+            storage_dir,
+            project_key,
+            None,
+        )
+    }
+
+    pub(crate) fn resume_cold_build_slice_with_ledger(
+        project_root: &Path,
+        files: &[PathBuf],
+        model: &mut SemanticEmbeddingModel,
+        config: &SemanticBackendConfig,
+        storage_dir: &Path,
+        project_key: &str,
+        ledger: Option<&Arc<crate::memory_admission::MemoryAdmissionLedger>>,
     ) -> Result<SemanticBuildSliceOutcome, String> {
         let canonical_root =
             fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
@@ -2919,7 +2961,19 @@ impl SemanticIndex {
                 .iter()
                 .map(|chunk| chunk.embed_text.clone())
                 .collect();
-            let vectors = model.embed(texts)?;
+            let vectors = if let Some(ledger) = ledger {
+                match embed_incremental_with_memory_admission(
+                    ledger,
+                    end - manifest.embed_cursor,
+                    fingerprint.dimension,
+                    || model.embed(texts),
+                )? {
+                    Some(vectors) => vectors,
+                    None => return Ok(SemanticBuildSliceOutcome::Yielded),
+                }
+            } else {
+                model.embed(texts)?
+            };
             validate_embedding_batch(&vectors, end - manifest.embed_cursor, "embedding backend")?;
             if vectors
                 .iter()
@@ -6113,6 +6167,20 @@ Connection: close
         }
 
         buf
+    }
+
+    #[test]
+    fn denied_semantic_memory_admission_skips_embedding_callback() {
+        let ledger = Arc::new(crate::memory_admission::MemoryAdmissionLedger::new(Some(0)));
+        let mut callback_called = false;
+        let result = embed_incremental_with_memory_admission(&ledger, 2, 4, || {
+            callback_called = true;
+            Ok(vec![vec![0.0; 4]; 2])
+        })
+        .expect("admission should yield without an error");
+        assert!(result.is_none());
+        assert!(!callback_called);
+        assert_eq!(ledger.snapshot().charged_bytes, 0);
     }
 
     #[derive(Default)]

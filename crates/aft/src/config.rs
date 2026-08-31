@@ -410,6 +410,13 @@ impl Default for BashConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Optional process memory ceiling in bytes. None means unlimited.
+    pub limit_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -488,6 +495,9 @@ pub struct Config {
     pub semantic: SemanticBackendConfig,
     pub inspect: InspectConfig,
     pub backup: BackupConfig,
+    /// User-only process memory admission ceiling. None means unlimited.
+    pub memory: MemoryConfig,
+
     /// Linked-worktree RAM overlay. Default off; see [`WorktreeConfig`].
     pub worktree: WorktreeConfig,
     /// `gh` routing shim operator gate. Default on; see [`GhShimConfig`].
@@ -586,6 +596,8 @@ impl Default for Config {
             semantic: SemanticBackendConfig::default(),
             inspect: InspectConfig::default(),
             backup: BackupConfig::default(),
+            memory: MemoryConfig::default(),
+
             worktree: WorktreeConfig::default(),
             gh_shim: GhShimConfig::default(),
             gh_read: GhReadConfig::default(),
@@ -615,6 +627,9 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memory_defaults_to_unlimited() {
+        assert_eq!(Config::default().memory.limit_bytes, None);
+    }
     fn index_root_path_expands_tilde_before_absolute_validation() {
         let home = std::env::temp_dir().join("aft-home");
         assert_eq!(

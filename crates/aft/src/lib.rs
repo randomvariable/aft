@@ -99,6 +99,7 @@ pub mod logging;
 pub mod lsp;
 pub mod lsp_hints;
 pub mod memory;
+pub mod memory_admission;
 pub mod migrate_storage;
 pub mod parser;
 pub mod patch;
