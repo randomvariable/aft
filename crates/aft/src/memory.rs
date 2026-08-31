@@ -228,7 +228,6 @@ pub struct AllocatorMemorySnapshot {
 }
 
 impl AllocatorMemorySnapshot {
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
     fn measured(bytes_in_use: u64, size_allocated: u64) -> Self {
         Self {
             status: "measured",
@@ -239,10 +238,6 @@ impl AllocatorMemorySnapshot {
         }
     }
 
-    // Not cfg-gated to the fallback platforms: linux-gnu also uses this at
-    // RUNTIME when the host glibc predates mallinfo2 (< 2.33), which only
-    // manifests on release binaries built against an old glibc floor.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn not_estimated(reason: &'static str) -> Self {
         Self {
             status: "not_estimated_on_this_platform",
@@ -622,54 +617,55 @@ fn nonnegative_i64_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-#[cfg(target_os = "macos")]
-fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
-    let mut statistics = std::mem::MaybeUninit::<libc::malloc_statistics_t>::zeroed();
-    unsafe {
-        libc::malloc_zone_statistics(libc::malloc_default_zone(), statistics.as_mut_ptr());
-    }
-    let statistics = unsafe { statistics.assume_init() };
-    AllocatorMemorySnapshot::measured(
-        usize_to_u64(statistics.size_in_use),
-        usize_to_u64(statistics.size_allocated),
-    )
+pub const fn allocator_backend_name() -> &'static str {
+    "mimalloc"
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
-    // mallinfo2 exists only in glibc >= 2.33. Release Linux binaries link
-    // against an older glibc floor (cross gnu images, kept old so dlopen and
-    // wide distro compatibility hold), so a link-time reference to the symbol
-    // fails the release build even though native CI (glibc 2.35) links fine.
-    // Resolve it at runtime instead and report honestly when it is absent.
-    use std::sync::OnceLock;
-    type Mallinfo2Fn = unsafe extern "C" fn() -> libc::mallinfo2;
-    static MALLINFO2: OnceLock<Option<Mallinfo2Fn>> = OnceLock::new();
-    let resolved = MALLINFO2.get_or_init(|| {
-        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
-        if symbol.is_null() {
-            None
-        } else {
-            // SAFETY: glibc declares mallinfo2 as `struct mallinfo2 (*)(void)`;
-            // the signature matches Mallinfo2Fn exactly.
-            Some(unsafe { std::mem::transmute::<*mut libc::c_void, Mallinfo2Fn>(symbol) })
-        }
-    });
-    let Some(mallinfo2) = resolved else {
-        return AllocatorMemorySnapshot::not_estimated("mallinfo2_requires_glibc_2_33");
+    let Ok(statistics) = mimalloc::MiMalloc::stats_json() else {
+        return AllocatorMemorySnapshot::not_estimated("mimalloc_statistics_unavailable");
     };
-    let statistics = unsafe { mallinfo2() };
-    let mapped_bytes = statistics.hblkhd as u64;
-    let bytes_in_use = (statistics.uordblks as u64).saturating_add(mapped_bytes);
-    let size_allocated = (statistics.arena as u64).saturating_add(mapped_bytes);
+    let Ok(statistics) = serde_json::from_slice::<Value>(statistics.to_bytes()) else {
+        return AllocatorMemorySnapshot::not_estimated("mimalloc_statistics_invalid");
+    };
+    let current = |field: &str| {
+        statistics
+            .get(field)
+            .and_then(|value| value.get("current"))
+            .and_then(Value::as_u64)
+    };
+    let Some(bytes_in_use) = current("malloc_requested") else {
+        return AllocatorMemorySnapshot::not_estimated("mimalloc_statistics_incomplete");
+    };
+    let Some(size_allocated) = current("committed") else {
+        return AllocatorMemorySnapshot::not_estimated("mimalloc_statistics_incomplete");
+    };
     AllocatorMemorySnapshot::measured(bytes_in_use, size_allocated)
+}
+
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorReliefCoverage {
+    pub mimalloc: bool,
+    pub platform_allocator: bool,
+}
+
+pub const fn allocator_relief_coverage() -> AllocatorReliefCoverage {
+    AllocatorReliefCoverage {
+        mimalloc: true,
+        platform_allocator: cfg!(any(
+            target_os = "macos",
+            all(target_os = "linux", target_env = "gnu")
+        )),
+    }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 type MallocTrimFn = unsafe extern "C" fn(libc::size_t) -> libc::c_int;
 
-/// Resolve glibc's optional trimming primitive without creating a link-time
-/// dependency on a symbol that musl and alternate allocators do not provide.
+/// Resolve glibc's optional trimming primitive without a link-time dependency.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn resolved_malloc_trim() -> Option<MallocTrimFn> {
     use std::sync::OnceLock;
@@ -680,8 +676,7 @@ fn resolved_malloc_trim() -> Option<MallocTrimFn> {
             if symbol.is_null() {
                 None
             } else {
-                // SAFETY: glibc declares malloc_trim as `int (size_t)`;
-                // the signature matches MallocTrimFn exactly.
+                // SAFETY: glibc declares malloc_trim as `int (size_t)`.
                 Some(unsafe { std::mem::transmute::<*mut libc::c_void, MallocTrimFn>(symbol) })
             }
         })
@@ -689,14 +684,28 @@ fn resolved_malloc_trim() -> Option<MallocTrimFn> {
         .copied()
 }
 
-#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
-    AllocatorMemorySnapshot::not_estimated("platform_allocator_statistics_unavailable")
-}
-
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut libc::malloc_zone_t, goal: usize) -> usize;
+}
+
+fn relieve_platform_allocator_pressure() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        return usize_to_u64(unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) });
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        if let Some(malloc_trim) = resolved_malloc_trim() {
+            // SAFETY: resolved_malloc_trim validated the symbol's C ABI.
+            unsafe { malloc_trim(0) };
+        }
+        return 0;
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    {
+        0
+    }
 }
 
 /// Allocator slack (mapped-but-unused arena bytes) above which opportunistic
@@ -705,8 +714,7 @@ pub const ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Minimum spacing between allocator slack scans.
 ///
-/// Linux `mallinfo2()` walks every glibc arena under allocator locks. Keep that
-/// work off the transport thread and do not repeat it on each maintenance tick.
+/// Keep allocator statistics and collection off the transport thread.
 pub const ALLOCATOR_SLACK_SCAN_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(300);
 
@@ -759,43 +767,27 @@ pub fn spawn_allocator_slack_scan_if_due(
         .is_ok()
 }
 
-/// Ask the platform allocator to return unused pages after a process-wide idle
-/// gate. Callers own that gate because allocator pressure relief can add
-/// latency. Linux invokes glibc's optional `malloc_trim(0)` when the symbol is
-/// available; non-glibc allocators intentionally remain a no-op.
-#[cfg(target_os = "macos")]
+/// Ask both allocator domains to return unused pages after a process-wide idle
+/// gate. Rust allocations use mimalloc. Native libraries can still allocate
+/// through the platform allocator, so its relief primitive remains necessary.
 pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
     let rss_before_bytes = process_rss_bytes();
     let allocator_before = allocator_memory_snapshot();
-    let bytes_released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    // SAFETY: `mi_collect` is provided by the linked mimalloc global allocator.
+    unsafe { mi_collect(true) };
+    let platform_released = relieve_platform_allocator_pressure();
     let allocator_after = allocator_memory_snapshot();
     let rss_after_bytes = process_rss_bytes();
-    AllocatorPressureRelief {
-        bytes_released: usize_to_u64(bytes_released),
-        rss_before_bytes,
-        rss_after_bytes,
-        allocator_before,
-        allocator_after,
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
-    let rss_before_bytes = process_rss_bytes();
-    let allocator_before = allocator_memory_snapshot();
-    #[cfg(target_env = "gnu")]
-    if let Some(malloc_trim) = resolved_malloc_trim() {
-        // SAFETY: resolved_malloc_trim verifies the symbol and its C ABI
-        // signature before returning the function pointer.
-        unsafe { malloc_trim(0) };
-    }
-    let allocator_after = allocator_memory_snapshot();
-    let rss_after_bytes = process_rss_bytes();
-    let bytes_released = allocator_before
+    let allocator_released = allocator_before
         .size_allocated
         .zip(allocator_after.size_allocated)
         .map(|(before, after)| before.saturating_sub(after))
         .unwrap_or(0);
+    let rss_released = rss_before_bytes
+        .zip(rss_after_bytes)
+        .map(|(before, after)| before.saturating_sub(after))
+        .unwrap_or(0);
+    let bytes_released = allocator_released.max(platform_released).max(rss_released);
     AllocatorPressureRelief {
         bytes_released,
         rss_before_bytes,
@@ -873,6 +865,33 @@ mod tests {
     }
 
     #[test]
+    fn allocator_backend_is_mimalloc() {
+        assert_eq!(allocator_backend_name(), "mimalloc");
+    }
+
+    #[test]
+    fn allocator_snapshot_uses_mimalloc_statistics() {
+        let snapshot = allocator_memory_snapshot();
+        assert_eq!(snapshot.status, "measured");
+        assert!(snapshot.bytes_in_use.is_some());
+        assert!(snapshot.size_allocated.is_some());
+        assert!(snapshot.retained_slack_bytes.is_some());
+    }
+    #[test]
+    fn pressure_relief_covers_rust_and_native_allocators() {
+        let coverage = allocator_relief_coverage();
+        assert!(coverage.mimalloc);
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        assert!(coverage.platform_allocator);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn glibc_native_relief_is_runtime_resolved() {
+        assert!(resolved_malloc_trim().is_some());
+    }
+
+    #[test]
     fn slack_relief_requires_large_measured_slack() {
         let threshold = ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES;
         assert!(!allocator_slack_relief_due(None));
@@ -923,32 +942,20 @@ mod tests {
             .is_some());
     }
 
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
     #[test]
     fn allocator_snapshot_reports_measured_slack() {
         let allocator = allocator_memory_snapshot();
-        if allocator.status == "measured" {
-            let in_use = allocator.bytes_in_use.expect("allocator bytes in use");
-            let allocated = allocator.size_allocated.expect("allocator size allocated");
-            assert_eq!(
-                allocator.retained_slack_bytes,
-                Some(allocated.saturating_sub(in_use))
-            );
-        } else {
-            assert_eq!(allocator.status, "not_estimated_on_this_platform");
-            assert_eq!(allocator.bytes_in_use, None);
-            assert_eq!(allocator.size_allocated, None);
-            assert_eq!(allocator.retained_slack_bytes, None);
-            assert_eq!(
-                allocator.not_estimated,
-                Some("mallinfo2_requires_glibc_2_33")
-            );
-        }
+        let in_use = allocator.bytes_in_use.expect("allocator bytes in use");
+        let allocated = allocator.size_allocated.expect("allocator size allocated");
+        assert_eq!(allocator.status, "measured");
+        assert_eq!(
+            allocator.retained_slack_bytes,
+            Some(allocated.saturating_sub(in_use))
+        );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn linux_allocator_pressure_relief_smoke() {
+    fn allocator_pressure_relief_smoke() {
         let mut allocation = vec![0u8; 32 * 1024 * 1024];
         for byte in allocation.iter_mut().step_by(4096) {
             *byte = 1;
@@ -957,30 +964,10 @@ mod tests {
         drop(allocation);
 
         let relief = relieve_allocator_pressure();
-        std::hint::black_box(relief);
-
-        #[cfg(target_env = "gnu")]
-        assert!(
-            resolved_malloc_trim().is_some(),
-            "glibc malloc_trim must be available for the Linux relief path"
-        );
+        assert_eq!(relief.allocator_before.status, "measured");
+        assert_eq!(relief.allocator_after.status, "measured");
     }
 
-    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-    #[test]
-    fn allocator_snapshot_is_honest_when_platform_counters_are_unavailable() {
-        let allocator = allocator_memory_snapshot();
-        assert_eq!(allocator.status, "not_estimated_on_this_platform");
-        assert_eq!(allocator.bytes_in_use, None);
-        assert_eq!(allocator.size_allocated, None);
-        assert_eq!(allocator.retained_slack_bytes, None);
-        assert_eq!(
-            allocator.not_estimated,
-            Some("platform_allocator_statistics_unavailable")
-        );
-    }
-
-    #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "bounded live RSS experiment; run explicitly after allocator changes"]
     fn allocator_pressure_relief_warm_then_idle_measurement() {
@@ -1012,5 +999,6 @@ mod tests {
         );
         assert_eq!(relief.allocator_before.status, "measured");
         assert_eq!(relief.allocator_after.status, "measured");
+        assert!(relief.bytes_released > 0);
     }
 }
